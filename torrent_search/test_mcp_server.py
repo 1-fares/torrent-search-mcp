@@ -44,7 +44,7 @@ async def test_get_torrent_nyaa(mcp_client: Client[Any]) -> None:
     async with mcp_client as client:
         result = await client.call_tool(
             "get_torrent",
-            {"torrent_id": "DLeDVjR9sx2X1eDdRe5-10-nyaa.si-62fc3d3c8c"},
+            {"torrent_id": "DLeDVjR9sx2X1eDdRe5-100-nyaa.si-62fc3d3c8c"},
         )
         assert (
             result is not None and len(result.content[0].text) > 32
