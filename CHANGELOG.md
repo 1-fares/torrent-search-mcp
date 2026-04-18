@@ -1,3 +1,14 @@
+## [2.3.2] - 2026-04-18
+
+### 📚 Documentation
+
+- Docs: update README with YggTorrent re-enablement and fix list numbering
+
+### ⚙️ Miscellaneous Tasks
+
+- Chore: update changelog
+- Chore: bump version to 2.3.2 and refactor scraper parsing logic
+
 ## [2.3.1] - 2026-03-08
 
 ### ⚙️ Miscellaneous Tasks
