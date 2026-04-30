@@ -1,3 +1,10 @@
+## [2.3.3] - 2026-04-30
+
+### ⚙️ Miscellaneous Tasks
+
+- Chore: update changelog with v2.3.2 release notes
+- Chore: update deps
+
 ## [2.3.2] - 2026-04-18
 
 ### 📚 Documentation
