@@ -358,9 +358,9 @@ async def scrape_torrents(query: str, sources: list[str] | None = None) -> list[
                         url=url, config=DEFAULT_CRAWLER_RUN_CONFIG
                     )
                     raw_content = (
-                        crawl_result.cleaned_html  # type: ignore
+                        crawl_result.cleaned_html
                         if data["parsing"] == "html"
-                        else crawl_result.markdown  # type: ignore
+                        else crawl_result.markdown
                     )
                     processed_text = parse_result(
                         raw_content,
