@@ -1,11 +1,27 @@
 import argparse
+import logging
+import os
 import subprocess
 from os import geteuid
+from pathlib import Path
 
 import uvicorn
 from playwright._impl._driver import compute_driver_executable, get_driver_env
 
 from .mcp_server import mcp
+
+logger = logging.getLogger(__name__)
+
+
+def chromium_installed() -> bool:
+    """Return True if a Playwright chromium build is already on disk."""
+    cache = Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH") or Path.home() / ".cache" / "ms-playwright")
+    if not cache.exists():
+        return False
+    try:
+        return any(p.name.startswith("chromium") for p in cache.iterdir())
+    except OSError:
+        return False
 
 
 def install_playwright_drivers() -> None:
@@ -22,8 +38,8 @@ def install_playwright_drivers() -> None:
         if completed_process.returncode == 0:
             print("Playwright drivers installed.")
             return
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Playwright driver install failed: %s", e)
     print("Failed to install Playwright drivers.")
 
 
@@ -36,9 +52,7 @@ def cli() -> None:
         default="stdio",
         help="Mode to run the server in. Default: stdio.",
     )
-    parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind the server to."
-    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to.")
     parser.add_argument(
         "--port",
         type=int,
@@ -56,10 +70,16 @@ def cli() -> None:
         default=1,
         help="Number of worker processes to use for the FastAPI server.",
     )
+    parser.add_argument(
+        "--force-install-browsers",
+        action="store_true",
+        help="Force a Playwright chromium install even if a cached build is present.",
+    )
 
     args = parser.parse_args()
 
-    install_playwright_drivers()
+    if args.force_install_browsers or not chromium_installed():
+        install_playwright_drivers()
 
     if args.mode == "fastapi":
         print(f"Starting FastAPI server on {args.host}:{args.port}")

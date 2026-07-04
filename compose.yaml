@@ -51,10 +51,14 @@ services:
       - 8000:8000
     environment:
       - YGG_LOCAL_API=http://ygg-api:8715
+      # In Docker we always store torrent files in /app/torrents and bind a
+      # named volume there. This overrides any FOLDER_TORRENT_FILES set in
+      # .env so the mount path can never end up malformed.
+      - FOLDER_TORRENT_FILES=/app/torrents
     env_file:
       - .env
     volumes:
-      - torrents:/app/${FOLDER_TORRENT_FILES:-torrents}
+      - torrents:/app/torrents
     <<: [ *default-dns, *default-logging ]
     network_mode: bridge
 

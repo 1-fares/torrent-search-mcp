@@ -1,29 +1,38 @@
 import logging
-from copy import deepcopy
 from os import getenv
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from .wrapper import Torrent, TorrentSearchApi
+from .wrapper import Torrent, TorrentSearchApi, crawler_lifespan
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Torrent Search")
 
-mcp: FastMCP[Any] = FastMCP("Torrent Search Tool")
+mcp: FastMCP[Any] = FastMCP("Torrent Search Tool", lifespan=crawler_lifespan)
 
 torrent_search_api = TorrentSearchApi()
 
 INCLUDE_LINKS = str(getenv("INCLUDE_LINKS")).lower() == "true"
-SOURCES = torrent_search_api.available_sources()
 
 
 @mcp.resource("data://torrent_sources")
 def available_sources() -> list[str]:
     """Get the list of available torrent sources."""
-    return SOURCES
+    return torrent_search_api.available_sources()
+
+
+def _render(torrent: Torrent, include_links: bool) -> str:
+    if include_links:
+        return str(torrent)
+    payload = torrent.model_dump(
+        exclude_unset=True,
+        exclude_none=True,
+        exclude={"magnet_link", "torrent_file"},
+    )
+    return str(payload)
 
 
 @mcp.tool()
@@ -59,22 +68,16 @@ async def search_torrents(
     - If results are poor or irrelevant, suggest specific keywords to improve the search.
     """
     _ = user_intent
-    logger.info(f"Searching for torrents: {query}")
+    logger.info("Searching for torrents: %s", query)
     found_torrents: list[Torrent] = await torrent_search_api.search_torrents(query)
     if not found_torrents:
         return "No torrents found"
-    elif found_torrents and not INCLUDE_LINKS:  # Greatly reduce token usage
-        shorted_torrents = deepcopy(found_torrents)  # Leave cache intact
-        for torrent in shorted_torrents:
-            torrent.magnet_link = None
-            torrent.torrent_file = None
-        return "\n".join([str(torrent) for torrent in shorted_torrents])
-    return "\n".join([str(torrent) for torrent in found_torrents])
+    return "\n".join(_render(t, INCLUDE_LINKS) for t in found_torrents)
 
 
 @mcp.tool()
 async def get_torrent(torrent_id: str) -> str:
     """Get the magnet link or torrent filepath for a specific torrent by id."""
-    logger.info(f"Getting magnet link or torrent filepath for torrent: {torrent_id}")
+    logger.info("Getting magnet link or torrent filepath for torrent: %s", torrent_id)
     result: str | None = await torrent_search_api.get_torrent(torrent_id)
     return result or "Torrent not found"

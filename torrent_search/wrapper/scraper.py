@@ -1,16 +1,30 @@
-from re import DOTALL, MULTILINE, Pattern
+import asyncio
+import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from re import DOTALL, MULTILINE, Pattern, sub
 from re import compile as re_compile
-from re import sub
 from time import time
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote
 
+import httpx
 from crawl4ai import AsyncWebCrawler, CacheMode
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from pydantic import ValidationError
 
 from .models import Torrent
+from .tpb import SOURCE as TPB_SOURCE
+from .tpb import fetch_tpb
+
+logger = logging.getLogger(__name__)
+
+HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Crawler Configuration
 BROWSER_CONFIG = BrowserConfig(
@@ -38,13 +52,9 @@ DEFAULT_CRAWLER_RUN_CONFIG = CrawlerRunConfig(
 
 # Websites Configuration
 FILTERS: dict[str, Pattern[str]] = {
-    "full_links": re_compile(
-        r"(http|https|ftp):[/]{1,2}[a-zA-Z0-9.]+[a-zA-Z0-9./?=+~_\-@:%#&]*"
-    ),
+    "full_links": re_compile(r"(http|https|ftp):[/]{1,2}[a-zA-Z0-9.]+[a-zA-Z0-9./?=+~_\-@:%#&]*"),
     "backslashes": re_compile(r"\\"),
-    "local_links": re_compile(
-        r"(a href=)*(<|\")\/[a-zA-Z0-9./?=+~()_\-@:%#&]*(>|\")* *"
-    ),
+    "local_links": re_compile(r"(a href=)*(<|\")\/[a-zA-Z0-9./?=+~()_\-@:%#&]*(>|\")* *"),
     "some_texts": re_compile(r' *"[a-zA-Z ]+" *'),
     "empty_angle_brackets": re_compile(r" *< *> *"),
     "empty_curly_brackets": re_compile(r" *\{ *\} *"),
@@ -66,9 +76,7 @@ REPLACERS: dict[str, tuple[Pattern[str], str | Callable[[Any], str]]] = {
     "thepiratebay_extract_magnet": (
         # Pattern matches: <a href="magnet:?xt=urn:btih:...">...</a>
         # Replace with just the magnet URL wrapped in >...> so it survives tag removal
-        re_compile(
-            r'<a[^>]*href="(magnet:\?[^"]*)"[^>]*>[^<]*(?:<img[^>]*>)?(?:&nbsp;)*</a>'
-        ),
+        re_compile(r'<a[^>]*href="(magnet:\?[^"]*)"[^>]*>[^<]*(?:<img[^>]*>)?(?:&nbsp;)*</a>'),
         r">\1>",
     ),
     # Step 2: For non-magnet anchor tags, keep the text content and remove just the tags
@@ -192,9 +200,7 @@ REPLACERS: dict[str, tuple[Pattern[str], str | Callable[[Any], str]]] = {
     # Pattern matches: |  [ ]()  [ ](magnet:...)  | -> captures the magnet URL
     # Note: there may be empty []() before the actual magnet link
     "nyaa_extract_magnet_link": (
-        re_compile(
-            r"\|\s*(?:\[\s*\]\s*\(\s*\)\s*)*\[\s*\]\s*\(\s*(magnet:\?[^\s)]+)\s*\)\s*\|"
-        ),
+        re_compile(r"\|\s*(?:\[\s*\]\s*\(\s*\)\s*)*\[\s*\]\s*\(\s*(magnet:\?[^\s)]+)\s*\)\s*\|"),
         r";\1;",
     ),
     # Remove the title attribute from markdown links: ( "...") before the closing )
@@ -262,18 +268,12 @@ REPLACERS: dict[str, tuple[Pattern[str], str | Callable[[Any], str]]] = {
         "|",
     ),
 }
+SCRAPER_SOURCES: tuple[str, ...] = (TPB_SOURCE, "nyaa.si")
+
+# Sources handled by the crawl4ai + regex-pipeline path. thepiratebay.org used
+# to be here but now goes through the apibay.org JSON API directly (see tpb.py),
+# which is ~10x faster and skips Chromium entirely.
 WEBSITES: dict[str, dict[str, str | list[str]]] = {
-    "thepiratebay.org": dict(
-        search="https://thepiratebay.org/search.php?q={query}&cat=0",
-        parsing="html",
-        exclude_patterns=[
-            "some_texts",  # Don't remove quoted attribute values
-            "local_links",  # Don't remove </li> tags
-            "single_angle_bracket",  # Don't remove HTML angle brackets
-            "html_tags",  # Don't remove HTML tags in filters (do it in replacers)
-            # But DO include ol_attributes filter
-        ],
-    ),
     "nyaa.si": dict(
         search="https://nyaa.si/?f=0&c=0_0&q={query}&s=seeders&o=desc",
         parsing="markdown",
@@ -290,6 +290,78 @@ WEBSITES: dict[str, dict[str, str | list[str]]] = {
 }
 
 crawler = AsyncWebCrawler(config=BROWSER_CONFIG, always_bypass_cache=True)
+
+_crawler_lock: asyncio.Lock | None = None
+_crawler_started: bool = False
+_http_client: httpx.AsyncClient | None = None
+_http_lock: asyncio.Lock | None = None
+
+
+async def ensure_crawler_started() -> None:
+    """Lazily start the headless browser. Idempotent and safe to call concurrently."""
+    global _crawler_lock, _crawler_started
+    if _crawler_started:
+        return
+    if _crawler_lock is None:
+        _crawler_lock = asyncio.Lock()
+    async with _crawler_lock:
+        if _crawler_started:
+            return
+        await crawler.start()
+        _crawler_started = True
+
+
+async def close_crawler() -> None:
+    global _crawler_started
+    if not _crawler_started:
+        return
+    try:
+        await crawler.close()
+    finally:
+        _crawler_started = False
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Lazily build a shared httpx client for the JSON-API scrapers."""
+    global _http_client, _http_lock
+    if _http_client is not None:
+        return _http_client
+    if _http_lock is None:
+        _http_lock = asyncio.Lock()
+    async with _http_lock:
+        if _http_client is None:
+            _http_client = httpx.AsyncClient(
+                timeout=HTTP_TIMEOUT,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json,*/*"},
+                follow_redirects=True,
+            )
+    return _http_client
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client is None:
+        return
+    try:
+        await _http_client.aclose()
+    finally:
+        _http_client = None
+
+
+@asynccontextmanager
+async def crawler_lifespan(_app: Any = None) -> AsyncIterator[None]:
+    """Lifespan helper for FastAPI / FastMCP that owns scraper resources.
+
+    Only the HTTP client is started eagerly: it's cheap and always needed
+    (the TPB path uses it). Chromium is started lazily on first nyaa request
+    so a missing or broken Playwright install can't block server startup.
+    """
+    await get_http_client()
+    try:
+        yield
+    finally:
+        await close_http_client()
+        await close_crawler()
 
 
 def parse_result(
@@ -329,46 +401,33 @@ def parse_result(
 
     if len(text) > max_chars:
         safe_truncate_pos = text.rfind("\n", 0, max_chars)
-        if safe_truncate_pos == -1:
-            text = text[:max_chars]
-        else:
-            text = text[:safe_truncate_pos]
+        text = text[:max_chars] if safe_truncate_pos == -1 else text[:safe_truncate_pos]
     text = sub(r"\n{2,}", "\n", text)
     return text.strip()
 
 
 async def scrape_torrents(query: str, sources: list[str] | None = None) -> list[str]:
-    """
-    Scrape torrents from ThePirateBay and Nyaa.
-
-    Args:
-        query: Search query.
-        sources: List of valid sources to scrape from.
-
-    Returns:
-        A list of text results.
-    """
-    results_list = []
-    async with crawler:
-        for source, data in WEBSITES.items():
-            if sources is None or source in sources:
-                url = str(data["search"]).format(query=quote(query))
-                try:
-                    crawl_result: Any = await crawler.arun(  # type: ignore
-                        url=url, config=DEFAULT_CRAWLER_RUN_CONFIG
-                    )
-                    raw_content = (
-                        crawl_result.cleaned_html
-                        if data["parsing"] == "html"
-                        else crawl_result.markdown
-                    )
-                    processed_text = parse_result(
-                        raw_content,
-                        list(data.get("exclude_patterns", [])),
-                    )
-                    results_list.append(f"SOURCE -> {source}\n{processed_text}")
-                except Exception as e:
-                    print(f"Error scraping {source} for query '{query}' at {url}: {e}")
+    """Run the crawl4ai pipeline against each WEBSITES entry the caller asked for."""
+    await ensure_crawler_started()
+    results_list: list[str] = []
+    for source, data in WEBSITES.items():
+        if sources is not None and source not in sources:
+            continue
+        url = str(data["search"]).format(query=quote(query))
+        try:
+            crawl_result: Any = await crawler.arun(  # type: ignore
+                url=url, config=DEFAULT_CRAWLER_RUN_CONFIG
+            )
+            raw_content = (
+                crawl_result.cleaned_html if data["parsing"] == "html" else crawl_result.markdown
+            )
+            processed_text = parse_result(
+                raw_content,
+                list(data.get("exclude_patterns", [])),
+            )
+            results_list.append(f"SOURCE -> {source}\n{processed_text}")
+        except Exception as e:
+            logger.warning("Error scraping %s for %r at %s: %s", source, query, url, e)
     return results_list
 
 
@@ -408,48 +467,51 @@ def extract_torrents(texts: list[str]) -> list[Torrent]:
                         # Remove the extra filename parts (indices 2 to 2+extra_count-1)
                         del values[2 : 1 + extra_count]
                 torrents.append(
-                    Torrent.format(**dict(zip(headers, values)), source=source)
+                    Torrent.format(**dict(zip(headers, values, strict=False)), source=source)
                 )
-            except ValidationError:
+            except ValidationError as e:
+                logger.debug("Skipped row from %s (validation): %s | row=%r", source, e, line)
                 continue
-            except Exception:
+            except Exception as e:
+                logger.debug("Skipped row from %s (parse): %s | row=%r", source, e, line)
                 continue
     return torrents
+
+
+async def _search_tpb_path(query: str) -> list[Torrent]:
+    client = await get_http_client()
+    return await fetch_tpb(query, client)
+
+
+async def _search_crawl4ai_path(query: str, sources: list[str]) -> list[Torrent]:
+    if not sources:
+        return []
+    scraped_results = await scrape_torrents(query, sources=sources)
+    return extract_torrents(scraped_results)
 
 
 async def search_torrents(
     query: str,
     sources: list[str] | None = None,
-    max_retries: int = 1,
 ) -> list[Torrent]:
-    """
-    Search for torrents on ThePirateBay and Nyaa.
-    Corresponds to GET /torrents
-
-    Args:
-        query: Search query.
-        sources: List of valid sources to scrape from.
-        max_retries: Maximum number of retries.
-
-    Returns:
-        A list of torrent results.
-    """
+    """Run all enabled English scrapers concurrently and merge their results."""
     start_time = time()
-    scraped_results: list[str] = await scrape_torrents(query, sources=sources)
-    torrents: list[Torrent] = []
-    retries = 0
-    while retries < max_retries:
-        try:
-            torrents = extract_torrents(scraped_results)
-            print(f"Successfully extracted results in {time() - start_time:.2f} sec.")
-            return torrents
-        except Exception:
-            retries += 1
-            print(f"Failed to extract results: Attempt {retries}/{max_retries}")
-    print(
-        f"Exhausted all {max_retries} retries. "
-        f"Returning empty list. Total time: {time() - start_time:.2f} sec."
+    enabled = (
+        list(SCRAPER_SOURCES) if sources is None else [s for s in SCRAPER_SOURCES if s in sources]
     )
+
+    tasks: list[Any] = []
+    if TPB_SOURCE in enabled:
+        tasks.append(_search_tpb_path(query))
+    crawl_sources = [s for s in enabled if s != TPB_SOURCE and s in WEBSITES]
+    if crawl_sources:
+        tasks.append(_search_crawl4ai_path(query, crawl_sources))
+
+    torrents: list[Torrent] = []
+    if tasks:
+        for batch in await asyncio.gather(*tasks):
+            torrents.extend(batch)
+    logger.info("Extracted %d torrents in %.2fs", len(torrents), time() - start_time)
     return torrents
 
 

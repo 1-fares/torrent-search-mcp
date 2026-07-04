@@ -1,14 +1,28 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.responses import FileResponse
 
-from .wrapper import Torrent, TorrentSearchApi
+from .wrapper import Torrent, TorrentSearchApi, close_crawler, ensure_crawler_started
+
+api_client = TorrentSearchApi()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    await ensure_crawler_started()
+    try:
+        yield
+    finally:
+        await close_crawler()
+
 
 app = FastAPI(
     title="Torrent Search FastAPI",
     description="FastAPI server for Torrent Search API.",
+    lifespan=lifespan,
 )
-
-api_client = TorrentSearchApi()
 
 
 @app.get("/", summary="Health Check", tags=["General"], response_model=dict[str, str])
@@ -17,6 +31,17 @@ async def health_check() -> dict[str, str]:
     Endpoint to check the health of the service.
     """
     return {"status": "ok"}
+
+
+@app.get(
+    "/sources",
+    summary="List Available Torrent Sources",
+    tags=["General"],
+    response_model=list[str],
+)
+async def list_sources() -> list[str]:
+    """List the torrent sources currently enabled on this server."""
+    return api_client.available_sources()
 
 
 @app.post(
@@ -30,7 +55,7 @@ async def search_torrents(
     max_items: int = 10,
 ) -> list[Torrent]:
     """
-    Search for torrents on sources [thepiratebay.org, nyaa.si, lacale].
+    Search for torrents on the configured sources.
     Corresponds to `TorrentSearchApi.search_torrents()`.
     """
     torrents: list[Torrent] = await api_client.search_torrents(query, max_items)

@@ -38,7 +38,7 @@ class Torrent(BaseModel):
         data["filename"] = data["filename"].strip()
         data["seeders"] = int(data["seeders"]) if data.get("seeders") else 0
         data["leechers"] = int(data["leechers"]) if data.get("leechers") else 0
-        data["downloads"] = data["downloads"] if data.get("downloads") else "N/A"
+        data["downloads"] = data["downloads"] if data.get("downloads") else None
         data["date"] = data["date"][:10]
         return cls(**data)
 
@@ -46,9 +46,30 @@ class Torrent(BaseModel):
         self.id = f"{Compress62.compress(query)}-{max_items}-{self.id}"
 
     @staticmethod
-    def extract_info(torrent_id: str) -> tuple[str, int, str, str]:
-        compressed_query, max_items, source, ref_id = torrent_id.split("-")
-        return Compress62.decompress(compressed_query), int(max_items), source, ref_id
+    def extract_info(
+        torrent_id: str, known_sources: list[str] | None = None
+    ) -> tuple[str, int, str, str]:
+        # Format: {compressed_query}-{max_items}-{source}-{ref_id}
+        # compressed_query is base62 (no dashes); max_items is int (no dashes).
+        # source/ref_id may legitimately contain dashes, so resolve them by
+        # matching the longest known source prefix instead of splitting blind.
+        parts = torrent_id.split("-", 2)
+        if len(parts) < 3:
+            raise ValueError(f"Invalid torrent ID format: {torrent_id!r}")
+        compressed_query, max_items_str, rest = parts
+        query = Compress62.decompress(compressed_query)
+        max_items = int(max_items_str)
+        if known_sources:
+            # Match the longest known source first so e.g. "foo.bar" wins over "foo".
+            sorted_sources: list[str] = sorted(known_sources, key=lambda s: len(s), reverse=True)
+            for src in sorted_sources:
+                prefix = f"{src}-"
+                if rest.startswith(prefix):
+                    return query, max_items, src, rest[len(prefix) :]
+        source, _, ref_id = rest.rpartition("-")
+        if not source or not ref_id:
+            raise ValueError(f"Invalid torrent ID format: {torrent_id!r}")
+        return query, max_items, source, ref_id
 
     def __str__(self) -> str:
         return str(self.model_dump(exclude_unset=True, exclude_none=True))
